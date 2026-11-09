@@ -60,6 +60,19 @@ var (
 
 	// ErrTxIterating is returned when Set or Delete are called while iterating.
 	ErrTxIterating = errors.New("tx is iterating")
+
+	// ErrIndexBuilding is returned when creating or replacing an index whose
+	// name is reserved by an in-progress online index build.
+	ErrIndexBuilding = errors.New("index build in progress")
+
+	// ErrIndexBuildCanceled is returned from an online index build handle
+	// when the build has been explicitly canceled.
+	ErrIndexBuildCanceled = errors.New("online index build canceled")
+
+	// ErrIndexBuildBudget is returned from an online index build handle when
+	// the number of committed changes waiting to be caught up has exceeded
+	// the configured build budget.
+	ErrIndexBuildBudget = errors.New("online index build change budget exceeded")
 )
 
 const useAbsEx = true
@@ -80,6 +93,14 @@ type DB struct {
 	persist   bool              // do we write to disk
 	shrinking bool              // when an aof shrink is in-process.
 	lastaofsz int               // the size of the last shrink aof size
+
+	// online index build state. The onlineBuilds map reserves the names of
+	// indexes that are being built asynchronously and acts as the fan-out
+	// target for committed change notifications. commitSeq is a monotonic
+	// counter of successful data commits used by builds to verify at publish
+	// time that no committed change was missed.
+	onlineBuilds map[string]*indexBuild
+	commitSeq    uint64
 }
 
 // SyncPolicy represents how often data is synced to disk.
@@ -147,6 +168,7 @@ func Open(path string) (*DB, error) {
 	db.keys = btreeNew(lessCtx(nil))
 	db.exps = btreeNew(lessCtx(&exctx{db}))
 	db.idxs = make(map[string]*index)
+	db.onlineBuilds = make(map[string]*indexBuild)
 	// initialize default configuration
 	db.config = Config{
 		SyncPolicy:           EverySecond,
@@ -176,13 +198,31 @@ func Open(path string) (*DB, error) {
 
 // Close releases all database resources.
 // All transactions must be closed before closing the database.
+// Any in-progress online index builds are asked to stop and Close blocks
+// until their build resources have been fully released.
 func (db *DB) Close() error {
 	db.mu.Lock()
-	defer db.mu.Unlock()
 	if db.closed {
+		db.mu.Unlock()
 		return ErrDatabaseClosed
 	}
 	db.closed = true
+	// Snapshot the active builds while holding the lock, then release it.
+	// Each build is asked to stop and Close waits for every build to reach
+	// its single terminal state before the file is closed.
+	builds := make([]*indexBuild, 0, len(db.onlineBuilds))
+	for _, b := range db.onlineBuilds {
+		builds = append(builds, b)
+	}
+	db.mu.Unlock()
+	for _, b := range builds {
+		b.requestClose()
+	}
+	for _, b := range builds {
+		<-b.doneCh
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	if db.persist {
 		db.file.Sync() // do a sync but ignore the error
 		if err := db.file.Close(); err != nil {
@@ -192,6 +232,7 @@ func (db *DB) Close() error {
 	// Let's release all references to nil. This will help both with debugging
 	// late usage panics and it provides a hint to the garbage collector
 	db.keys, db.exps, db.idxs, db.file = nil, nil, nil, nil
+	db.onlineBuilds = nil
 	return nil
 }
 
@@ -1083,6 +1124,11 @@ type txWriteContext struct {
 	commitItems     map[string]*dbItem // details for committing tx.
 	itercount       int                // stack of iterators
 	rollbackIndexes map[string]*index  // details for dropped indexes.
+
+	// changedKeys records the keys touched by Set/Delete while an online
+	// index build is active. It is only consumed by the in-memory build
+	// notification path; persistent databases already keep commitItems.
+	changedKeys map[string]struct{}
 }
 
 // DeleteAll deletes all items from the database.
@@ -1115,6 +1161,9 @@ func (tx *Tx) DeleteAll() error {
 
 	// always clear out the commits
 	tx.wc.commitItems = make(map[string]*dbItem)
+
+	// pre-flush key changes are superseded by the flush event.
+	tx.wc.changedKeys = make(map[string]struct{})
 
 	return nil
 }
@@ -1253,6 +1302,12 @@ func (tx *Tx) Commit() error {
 		}
 		// Increment the number of flushes. The background syncing uses this.
 		tx.db.flushes++
+	}
+	// Fan out successfully committed changes to any online index builds.
+	// A rolled back transaction or a failed AOF write never reaches this
+	// point, therefore such changes can never enter a build.
+	if err == nil {
+		tx.db.notifyOnlineBuilds(tx.wc)
 	}
 	// Unlock the database and allow for another writable transaction.
 	tx.unlock()
@@ -1557,6 +1612,7 @@ func (tx *Tx) Set(key, value string, opts *SetOptions) (previousValue string,
 	if tx.db.persist {
 		tx.wc.commitItems[key] = item
 	}
+	tx.noteBuildKey(key)
 	return previousValue, replaced, nil
 }
 
@@ -1606,6 +1662,7 @@ func (tx *Tx) Delete(key string) (val string, err error) {
 	if tx.db.persist {
 		tx.wc.commitItems[key] = nil
 	}
+	tx.noteBuildKey(key)
 	// Even though the item has been deleted, we still want to check
 	// if it has expired. An expired item should not be returned.
 	if item.expired() {
@@ -2104,6 +2161,46 @@ func (tx *Tx) CreateSpatialIndexOptions(name, pattern string,
 	return tx.createIndex(name, pattern, nil, rect, nil)
 }
 
+// resolveLess combines an optional list of less functions into a single
+// comparison function. No inputs yields nil, one input is returned as-is,
+// and multiple inputs are chained into a compound comparison.
+func resolveLess(lessers []func(a, b string) bool) func(a, b string) bool {
+	switch len(lessers) {
+	case 0:
+		// no less function
+		return nil
+	case 1:
+		return lessers[0]
+	default:
+		// multiple less functions specified.
+		// create a compound less function.
+		return func(a, b string) bool {
+			for i := 0; i < len(lessers)-1; i++ {
+				if lessers[i](a, b) {
+					return true
+				}
+				if lessers[i](b, a) {
+					return false
+				}
+			}
+			return lessers[len(lessers)-1](a, b)
+		}
+	}
+}
+
+// noteBuildKey records a key touched by a Set or Delete while at least one
+// online index build is active. The record is only consumed by the in-memory
+// commit notification path.
+func (tx *Tx) noteBuildKey(key string) {
+	if len(tx.db.onlineBuilds) == 0 {
+		return
+	}
+	if tx.wc.changedKeys == nil {
+		tx.wc.changedKeys = make(map[string]struct{})
+	}
+	tx.wc.changedKeys[key] = struct{}{}
+}
+
 // createIndex is called by CreateIndex() and CreateSpatialIndex()
 func (tx *Tx) createIndex(name string, pattern string,
 	lessers []func(a, b string) bool,
@@ -2127,28 +2224,13 @@ func (tx *Tx) createIndex(name string, pattern string,
 		// index with name already exists. error.
 		return ErrIndexExists
 	}
-	// genreate a less function
-	var less func(a, b string) bool
-	switch len(lessers) {
-	default:
-		// multiple less functions specified.
-		// create a compound less function.
-		less = func(a, b string) bool {
-			for i := 0; i < len(lessers)-1; i++ {
-				if lessers[i](a, b) {
-					return true
-				}
-				if lessers[i](b, a) {
-					return false
-				}
-			}
-			return lessers[len(lessers)-1](a, b)
-		}
-	case 0:
-		// no less function
-	case 1:
-		less = lessers[0]
+	// check if an online build is reserving the name. A build name can
+	// never be overwritten by another create or replace operation.
+	if _, ok := tx.db.onlineBuilds[name]; ok {
+		return ErrIndexBuilding
 	}
+	// genreate a less function
+	less := resolveLess(lessers)
 	var sopts IndexOptions
 	if opts != nil {
 		sopts = *opts
