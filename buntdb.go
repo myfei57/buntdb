@@ -1389,7 +1389,7 @@ func (dbi *dbItem) writeDeleteTo(buf []byte) []byte {
 // expired evaluates id the item has expired. This will always return false when
 // the item does not have `opts.ex` set to true.
 func (dbi *dbItem) expired() bool {
-	return dbi.opts != nil && dbi.opts.ex && time.Now().After(dbi.opts.exat)
+	return dbi.expiredAt(time.Now())
 }
 
 // MaxTime from http://stackoverflow.com/questions/25065055#32620397
@@ -1424,6 +1424,18 @@ func (dbi *dbItem) Less(dbi2 *dbItem, ctx interface{}) bool {
 	case *index:
 		if ctx.less != nil {
 			// Using an index
+			if ctx.less(dbi.val, dbi2.val) {
+				return true
+			}
+			if ctx.less(dbi2.val, dbi.val) {
+				return false
+			}
+		}
+	case *snapshotIndex:
+		// Using an index captured by a read-only snapshot. The comparator is
+		// the same pure function captured at snapshot creation time, and the
+		// key fallback below still provides absolute uniqueness.
+		if ctx.less != nil {
 			if ctx.less(dbi.val, dbi2.val) {
 				return true
 			}
