@@ -1389,7 +1389,13 @@ func (dbi *dbItem) writeDeleteTo(buf []byte) []byte {
 // expired evaluates id the item has expired. This will always return false when
 // the item does not have `opts.ex` set to true.
 func (dbi *dbItem) expired() bool {
-	return dbi.opts != nil && dbi.opts.ex && time.Now().After(dbi.opts.exat)
+	return dbi.expiredAt(time.Now())
+}
+
+// expiredAt reports whether the item has expired at the provided time. It
+// allows an operation to judge every item against a single fixed timestamp.
+func (dbi *dbItem) expiredAt(now time.Time) bool {
+	return dbi.opts != nil && dbi.opts.ex && now.After(dbi.opts.exat)
 }
 
 // MaxTime from http://stackoverflow.com/questions/25065055#32620397
@@ -1634,6 +1640,183 @@ func (tx *Tx) TTL(key string) (time.Duration, error) {
 		return 0, ErrNotFound
 	}
 	return dur, nil
+}
+
+// MovePrefixConflictError is returned by Tx.MovePrefix when overwrite is
+// false and one or more destination keys are already occupied by live items
+// that do not themselves take part in the same move. Occupants that have
+// expired but have not been evicted yet do not count as occupancy.
+type MovePrefixConflictError struct {
+	// Keys holds the conflicting destination keys, sorted lexicographically.
+	Keys []string
+}
+
+// Error implements the error interface.
+func (e *MovePrefixConflictError) Error() string {
+	return fmt.Sprintf("move-prefix conflict on %d key(s)", len(e.Keys))
+}
+
+// MovePrefix moves every live item whose key begins with srcPrefix to the key
+// obtained by replacing srcPrefix with dstPrefix. The match is performed on
+// raw key bytes rather than glob patterns:
+//
+//	dstKey = dstPrefix + srcKey[len(srcPrefix):]
+//
+// Each item keeps its value and its absolute expiration time verbatim; the
+// remaining TTL is never recomputed. An empty srcPrefix selects the whole key
+// space and an empty dstPrefix strips the prefix. When srcPrefix and
+// dstPrefix are equal the operation has no effect and returns zero.
+//
+// The source set is snapshotted before anything is modified. Destination keys
+// that fall back inside the source range therefore never cause a freshly
+// created key to be migrated a second time, even when the two prefix ranges
+// overlap. Because all mutation happens after the snapshot scan, iterating
+// the source range cannot violate ErrTxIterating.
+//
+// When overwrite is false, a live destination occupant that is not itself a
+// member of the source set aborts the whole operation: no tree, index or
+// expiration entry is touched and a *MovePrefixConflictError listing every
+// conflicting key is returned. The transaction remains usable. When
+// overwrite is true, such occupants (along with their index and expiration
+// entries) are removed and replaced by the incoming items. In both modes an
+// expired-but-not-yet-evicted occupant is treated as free space, judged with
+// the single operation timestamp.
+//
+// Only a writable transaction that is not currently iterating may call
+// MovePrefix. The transaction write lock is retained and no nested
+// transaction is opened. The returned count is the number of items actually
+// migrated; expired items encountered during the source scan are excluded.
+func (tx *Tx) MovePrefix(srcPrefix, dstPrefix string,
+	overwrite bool) (moved int, err error) {
+	if tx.db == nil {
+		return 0, ErrTxClosed
+	} else if !tx.writable {
+		return 0, ErrTxNotWritable
+	} else if tx.wc.itercount > 0 {
+		return 0, ErrTxIterating
+	}
+	// Replacing a prefix by itself cannot change a single key.
+	if srcPrefix == dstPrefix {
+		return 0, nil
+	}
+	// One timestamp governs every expiration decision in the operation.
+	now := time.Now()
+
+	// Phase 1: snapshot the source set. No tree is mutated while scanning,
+	// which keeps the operation legal outside of an iteration and guarantees
+	// that keys generated later in the move are never re-scanned.
+	type moveEntry struct {
+		src *dbItem
+		dst string
+	}
+	var moves []moveEntry
+	source := make(map[string]struct{})
+	btreeAscendGreaterOrEqual(tx.db.keys, &dbItem{key: srcPrefix},
+		func(item interface{}) bool {
+			dbi := item.(*dbItem)
+			if !strings.HasPrefix(dbi.key, srcPrefix) {
+				// Past the end of the prefix range.
+				return false
+			}
+			if dbi.expiredAt(now) {
+				// Expired items are left for the usual eviction process and
+				// are neither migrated nor counted.
+				return true
+			}
+			moves = append(moves, moveEntry{
+				src: dbi,
+				dst: dstPrefix + dbi.key[len(srcPrefix):],
+			})
+			source[dbi.key] = struct{}{}
+			return true
+		})
+	if len(moves) == 0 {
+		return 0, nil
+	}
+
+	// Phase 2: reject-mode conflict detection against the untouched key space.
+	if !overwrite {
+		var conflicts []string
+		for _, mv := range moves {
+			if _, migrating := source[mv.dst]; migrating {
+				// The occupant is an old identity that moves in this same
+				// operation, not an external conflict.
+				continue
+			}
+			if occupant := tx.db.get(mv.dst); occupant != nil &&
+				!occupant.expiredAt(now) {
+				conflicts = append(conflicts, mv.dst)
+			}
+		}
+		if len(conflicts) != 0 {
+			sort.Strings(conflicts)
+			// No mutation has happened: the transaction stays fully usable.
+			return 0, &MovePrefixConflictError{Keys: conflicts}
+		}
+	}
+
+	// Phase 3: record the pre-operation state of every touched key so that a
+	// rollback or a failed commit can restore both migrated and overwritten
+	// items exactly, including their absolute expiration. The earliest change
+	// performed inside the transaction wins, mirroring Set/Delete semantics.
+	// A DeleteAll call has already backed up the whole database, in which
+	// case the per-key map is unused.
+	if tx.wc.rbkeys == nil {
+		for _, mv := range moves {
+			if _, ok := tx.wc.rollbackItems[mv.src.key]; !ok {
+				tx.wc.rollbackItems[mv.src.key] = tx.db.get(mv.src.key)
+			}
+			if _, ok := tx.wc.rollbackItems[mv.dst]; !ok {
+				tx.wc.rollbackItems[mv.dst] = tx.db.get(mv.dst)
+			}
+		}
+	}
+
+	// Phase 4: detach every touched key from the keys tree, the expiration
+	// tree and every index matched by its OLD key. Clearing before inserting
+	// also handles keys that are both a source and a destination without
+	// migrating them twice, and guarantees that an index pattern change
+	// cannot leave stale entries behind.
+	cleared := make(map[string]struct{}, len(moves)*2)
+	clear := func(key string) {
+		if _, ok := cleared[key]; ok {
+			return
+		}
+		cleared[key] = struct{}{}
+		tx.db.deleteFromDatabase(&dbItem{key: key})
+	}
+	for _, mv := range moves {
+		clear(mv.src.key)
+		clear(mv.dst)
+	}
+
+	// Phase 5: reinsert each item under its new key. The value and options,
+	// including the absolute expiration, are reused as-is so no TTL is
+	// recomputed. Index membership is derived from the new key pattern.
+	finals := make(map[string]*dbItem, len(moves))
+	for _, mv := range moves {
+		item := &dbItem{
+			key:  mv.dst,
+			val:  mv.src.val,
+			opts: mv.src.opts,
+		}
+		tx.db.insertIntoDatabase(item)
+		finals[mv.dst] = item
+	}
+
+	// Phase 6: feed the AOF commit log with the final state of every touched
+	// key: a SET for surviving keys, a DEL for sources that vanished.
+	if tx.db.persist {
+		for key := range cleared {
+			if _, ok := finals[key]; !ok {
+				tx.wc.commitItems[key] = nil
+			}
+		}
+		for key, item := range finals {
+			tx.wc.commitItems[key] = item
+		}
+	}
+	return len(moves), nil
 }
 
 // scan iterates through a specified index and calls user-defined iterator

@@ -7,6 +7,8 @@ import (
 	"io/ioutil"
 	"math/rand"
 	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -2957,4 +2959,953 @@ func TestIssue112(t *testing.T) {
 		})
 		return err
 	})
+}
+
+// ---- Tx.MovePrefix tests ----
+
+// mpEntry is one record of an independent key-space snapshot. A zero exat
+// means the item never expires.
+type mpEntry struct {
+	val  string
+	exat time.Time
+}
+
+func mpClone(m map[string]mpEntry) map[string]mpEntry {
+	out := make(map[string]mpEntry, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func mpSortedKeys(m map[string]mpEntry) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func mpSameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// mpSnapshot builds an independent snapshot of the live key space, including
+// absolute expiration times, without calling MovePrefix.
+func mpSnapshot(t *testing.T, db *DB) map[string]mpEntry {
+	t.Helper()
+	snap := make(map[string]mpEntry)
+	err := db.View(func(tx *Tx) error {
+		return tx.Ascend("", func(key, value string) bool {
+			ent := mpEntry{val: value}
+			if dbi := tx.db.get(key); dbi != nil && dbi.opts != nil && dbi.opts.ex {
+				ent.exat = dbi.opts.exat
+			}
+			snap[key] = ent
+			return true
+		})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return snap
+}
+
+// mpModel applies the documented MovePrefix semantics to an independent
+// snapshot and returns the expected live key space plus conflict keys. All
+// expiration decisions use the single fixed "now" timestamp.
+func mpModel(snap map[string]mpEntry, srcPrefix, dstPrefix string,
+	overwrite bool, now time.Time) (map[string]mpEntry, []string) {
+	if srcPrefix == dstPrefix {
+		return mpClone(snap), nil
+	}
+	keys := mpSortedKeys(snap)
+	type move struct {
+		src string
+		dst string
+		ent mpEntry
+	}
+	var moves []move
+	srcSet := make(map[string]struct{})
+	for _, k := range keys {
+		if !strings.HasPrefix(k, srcPrefix) {
+			continue
+		}
+		ent := snap[k]
+		if !ent.exat.IsZero() && now.After(ent.exat) {
+			continue // expired source: scanned but not migrated
+		}
+		moves = append(moves, move{
+			src: k,
+			dst: dstPrefix + k[len(srcPrefix):],
+			ent: ent,
+		})
+		srcSet[k] = struct{}{}
+	}
+	out := mpClone(snap)
+	var conflicts []string
+	for _, m := range moves {
+		if _, migrating := srcSet[m.dst]; migrating {
+			// old identity taking part in the same move: not a conflict
+			continue
+		}
+		if occ, ok := out[m.dst]; ok &&
+			(occ.exat.IsZero() || !now.After(occ.exat)) {
+			conflicts = append(conflicts, m.dst)
+		}
+	}
+	if !overwrite && len(conflicts) > 0 {
+		sort.Strings(conflicts)
+		return mpClone(snap), conflicts
+	}
+	for _, m := range moves {
+		delete(out, m.src)
+	}
+	for _, m := range moves {
+		out[m.dst] = m.ent
+	}
+	return out, nil
+}
+
+// mpCompare asserts that the live database key space matches the model in
+// keys, values and absolute expiration times.
+func mpCompare(t *testing.T, db *DB, want map[string]mpEntry) {
+	t.Helper()
+	got := mpSnapshot(t, db)
+	if len(got) != len(want) {
+		t.Fatalf("key count mismatch:\n got %v\nwant %v",
+			mpSortedKeys(got), mpSortedKeys(want))
+	}
+	for k, w := range want {
+		g, ok := got[k]
+		if !ok {
+			t.Fatalf("missing expected key %q", k)
+		}
+		if g.val != w.val {
+			t.Fatalf("key %q value: got %q, want %q", k, g.val, w.val)
+		}
+		if !g.exat.Equal(w.exat) {
+			t.Fatalf("key %q exat: got %v, want %v", k, g.exat, w.exat)
+		}
+	}
+	for k := range got {
+		if _, ok := want[k]; !ok {
+			t.Fatalf("unexpected key %q", k)
+		}
+	}
+}
+
+// mpSeed (re)creates an in-memory database and fills it deterministically.
+func mpSeed(t *testing.T, items map[string]mpEntry) *DB {
+	t.Helper()
+	db, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		for _, k := range mpSortedKeys(items) {
+			ent := items[k]
+			var opts *SetOptions
+			if !ent.exat.IsZero() {
+				opts = &SetOptions{Expires: true, TTL: time.Until(ent.exat)}
+			}
+			if _, _, err := tx.Set(k, ent.val, opts); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return db
+}
+
+func mpMove(t *testing.T, db *DB, src, dst string,
+	overwrite bool) (int, error) {
+	t.Helper()
+	var n int
+	err := db.Update(func(tx *Tx) error {
+		var err error
+		n, err = tx.MovePrefix(src, dst, overwrite)
+		return err
+	})
+	return n, err
+}
+
+// TestMovePrefixIntoSubPrefix moves a prefix into one of its own sub-prefixes.
+// Newly created keys fall back inside the source range and must not be
+// migrated a second time.
+func TestMovePrefixIntoSubPrefix(t *testing.T) {
+	now := time.Now()
+	seed := map[string]mpEntry{
+		"a/1":     {"v1", time.Time{}},
+		"a/b/2":   {"v2", now.Add(time.Hour)},
+		"a/b/c/3": {"v3", time.Time{}},
+		"other":   {"o", now.Add(2 * time.Hour)},
+	}
+	db := mpSeed(t, seed)
+	defer db.Close()
+	before := mpSnapshot(t, db)
+
+	n, err := mpMove(t, db, "a/", "a/b/", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Fatalf("expected 3 migrated, got %d", n)
+	}
+	want, _ := mpModel(before, "a/", "a/b/", true, now)
+	mpCompare(t, db, want)
+	// explicit identity checks
+	db.View(func(tx *Tx) error {
+		for _, c := range []struct{ key, val string }{
+			{"a/b/1", "v1"},
+			{"a/b/b/2", "v2"},
+			{"a/b/b/c/3", "v3"},
+			{"other", "o"},
+		} {
+			if v, err := tx.Get(c.key); err != nil || v != c.val {
+				t.Fatalf("key %q: got %q/%v", c.key, v, err)
+			}
+		}
+		for _, gone := range []string{"a/1", "a/b/2", "a/b/c/3"} {
+			if _, err := tx.Get(gone); err != ErrNotFound {
+				t.Fatalf("key %q should be gone", gone)
+			}
+		}
+		return nil
+	})
+	// the moved item kept its exact absolute expiration
+	db.View(func(tx *Tx) error {
+		dbi := tx.db.get("a/b/b/2")
+		if dbi == nil || dbi.opts == nil || !dbi.opts.exat.Equal(before["a/b/2"].exat) {
+			t.Fatalf("absolute exat not preserved: %+v", dbi)
+		}
+		return nil
+	})
+}
+
+// TestMovePrefixSubToParent moves a sub-prefix onto its parent prefix,
+// including a chained move where a destination is itself a migrating source.
+func TestMovePrefixSubToParent(t *testing.T) {
+	now := time.Now()
+	seed := map[string]mpEntry{
+		"a/b/1":   {"from-1", time.Time{}},
+		"a/b/2":   {"from-2", now.Add(time.Hour)},
+		"a/b/x":   {"from-x", time.Time{}},
+		"a/b/b/x": {"from-bx", now.Add(time.Hour)},
+		"a/1":     {"ext", time.Time{}},             // external live occupant
+		"a/2":     {"expired", now.Add(-time.Hour)}, // expired occupant
+		"keep":    {"k", time.Time{}},
+	}
+	db := mpSeed(t, seed)
+	defer db.Close()
+	before := mpSnapshot(t, db)
+
+	// reject mode: a/1 is an external live conflict; a/2 is expired and
+	// therefore free; a/b/x is a migrating identity, not a conflict.
+	_, err := mpMove(t, db, "a/b/", "a/", false)
+	var cerr *MovePrefixConflictError
+	if !errors.As(err, &cerr) {
+		t.Fatalf("expected MovePrefixConflictError, got %v", err)
+	}
+	if !mpSameStrings(cerr.Keys, []string{"a/1"}) {
+		t.Fatalf("unexpected conflicts: %v", cerr.Keys)
+	}
+	// rejected operation is side-effect free
+	mpCompare(t, db, before)
+
+	// overwrite mode applies the move; the expired occupant is replaced
+	n, err := mpMove(t, db, "a/b/", "a/", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 4 {
+		t.Fatalf("expected 4 migrated, got %d", n)
+	}
+	want, _ := mpModel(before, "a/b/", "a/", true, now)
+	mpCompare(t, db, want)
+	db.View(func(tx *Tx) error {
+		if v, _ := tx.Get("a/1"); v != "from-1" {
+			t.Fatalf("a/1 = %q, external occupant should be overwritten", v)
+		}
+		if v, _ := tx.Get("a/2"); v != "from-2" {
+			t.Fatalf("a/2 = %q, expired occupant should be replaced", v)
+		}
+		if v, _ := tx.Get("a/x"); v != "from-x" {
+			t.Fatalf("a/x = %q", v)
+		}
+		if v, _ := tx.Get("a/b/x"); v != "from-bx" {
+			t.Fatalf("a/b/x = %q (chained destination)", v)
+		}
+		if v, _ := tx.Get("keep"); v != "k" {
+			t.Fatalf("keep = %q", v)
+		}
+		return nil
+	})
+}
+
+// TestMovePrefixEmptyAndNUL covers empty prefixes (whole-db move / prefix
+// stripping), the empty key, an exact-prefix key and embedded NUL bytes.
+func TestMovePrefixEmptyAndNUL(t *testing.T) {
+	now := time.Now()
+	seed := map[string]mpEntry{
+		"":       {"root", time.Time{}},
+		"p":      {"exact", now.Add(time.Hour)},
+		"p:1":    {"p1", time.Time{}},
+		"x":      {"ex", now.Add(2 * time.Hour)},
+		"a\x00b": {"nul\x00val", time.Time{}},
+	}
+	db := mpSeed(t, seed)
+	defer db.Close()
+	before := mpSnapshot(t, db)
+
+	// empty source prefix: the whole key space moves under "ns/"
+	n, err := mpMove(t, db, "", "ns/", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 5 {
+		t.Fatalf("expected 5 migrated, got %d", n)
+	}
+	want, _ := mpModel(before, "", "ns/", true, now)
+	mpCompare(t, db, want)
+	db.View(func(tx *Tx) error {
+		if v, _ := tx.Get("ns/"); v != "root" {
+			t.Fatalf("empty key moved to ns/: got %q", v)
+		}
+		if v, _ := tx.Get("ns/a\x00b"); v != "nul\x00val" {
+			t.Fatalf("embedded NUL key lost: %q", v)
+		}
+		return nil
+	})
+
+	// empty destination prefix strips the prefix, restoring the key space
+	n, err = mpMove(t, db, "ns/", "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 5 {
+		t.Fatalf("expected 5 migrated, got %d", n)
+	}
+	mpCompare(t, db, before)
+
+	// exact-prefix key maps to the destination prefix with empty suffix
+	db2 := mpSeed(t, map[string]mpEntry{"p": {"exact", time.Time{}}})
+	defer db2.Close()
+	if _, err := mpMove(t, db2, "p", "q", true); err != nil {
+		t.Fatal(err)
+	}
+	db2.View(func(tx *Tx) error {
+		if _, err := tx.Get("q"); err != nil {
+			t.Fatalf("exact prefix key should become q: %v", err)
+		}
+		if _, err := tx.Get("p"); err != ErrNotFound {
+			t.Fatalf("p should be gone")
+		}
+		return nil
+	})
+
+	// identical prefixes, including the empty prefix, are no-ops
+	for _, pre := range []string{"", "a/", "ns/"} {
+		db3 := mpSeed(t, seed)
+		snap := mpSnapshot(t, db3)
+		n, err := mpMove(t, db3, pre, pre, true)
+		if err != nil || n != 0 {
+			t.Fatalf("no-op expected, got n=%d err=%v", n, err)
+		}
+		mpCompare(t, db3, snap)
+		db3.Close()
+	}
+}
+
+// TestMovePrefixExpired covers expired sources (scanned but not migrated or
+// counted) and expired destination occupants (free space, never a conflict).
+func TestMovePrefixExpired(t *testing.T) {
+	now := time.Now()
+	seed := map[string]mpEntry{
+		"a/dead":  {"d", now.Add(-time.Hour)},
+		"a/live":  {"l", now.Add(time.Hour)},
+		"b/live":  {"old-target", now.Add(-2 * time.Hour)}, // expired target
+		"outside": {"o", time.Time{}},
+	}
+	db := mpSeed(t, seed)
+	defer db.Close()
+	before := mpSnapshot(t, db)
+
+	// reject mode must not flag the expired target b/live as a conflict
+	n, err := mpMove(t, db, "a/", "b/", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("only the live source counts, got %d", n)
+	}
+	want, _ := mpModel(before, "a/", "b/", false, now)
+	mpCompare(t, db, want)
+
+	db.View(func(tx *Tx) error {
+		// expired source is physically untouched under its old key
+		if dbi := tx.db.get("a/dead"); dbi == nil || dbi.val != "d" {
+			t.Fatalf("expired source missing or altered: %+v", dbi)
+		}
+		if _, err := tx.Get("a/dead"); err != ErrNotFound {
+			t.Fatalf("expired source must stay invisible to Get")
+		}
+		// migrated item replaced the expired target and is now live
+		if v, err := tx.Get("b/live"); err != nil || v != "l" {
+			t.Fatalf("b/live = %q, %v", v, err)
+		}
+		if _, err := tx.Get("b/dead"); err != ErrNotFound {
+			t.Fatalf("expired item must not be migrated")
+		}
+		return nil
+	})
+}
+
+// TestMovePrefixConflict verifies atomic reject behavior: all conflicts are
+// reported, nothing is mutated and the transaction stays usable.
+func TestMovePrefixConflict(t *testing.T) {
+	now := time.Now()
+	seed := map[string]mpEntry{
+		"a/1": {"1", time.Time{}},
+		"a/2": {"2", now.Add(time.Hour)},
+		"b/1": {"x", time.Time{}},
+		"b/2": {"y", now.Add(3 * time.Hour)},
+	}
+	db := mpSeed(t, seed)
+	defer db.Close()
+	before := mpSnapshot(t, db)
+
+	err := db.Update(func(tx *Tx) error {
+		n, err := tx.MovePrefix("a/", "b/", false)
+		if err == nil {
+			t.Fatal("expected conflict error")
+		}
+		if n != 0 {
+			t.Fatalf("conflicted move must report zero, got %d", n)
+		}
+		var cerr *MovePrefixConflictError
+		if !errors.As(err, &cerr) {
+			t.Fatalf("expected MovePrefixConflictError, got %T %v", err, err)
+		}
+		if !mpSameStrings(cerr.Keys, []string{"b/1", "b/2"}) {
+			t.Fatalf("unexpected conflicts: %v", cerr.Keys)
+		}
+		// transaction remains usable within the same tx
+		if _, _, err := tx.Set("after", "ok", nil); err != nil {
+			t.Fatalf("tx unusable after conflict: %v", err)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := mpClone(before)
+	want["after"] = mpEntry{val: "ok"}
+	mpCompare(t, db, want)
+}
+
+// TestMovePrefixRollback checks that rollback restores migrated and
+// overwritten items, including expired occupants and absolute TTLs, and that
+// a DeleteAll+MovePrefix combination is fully reversible as well.
+func TestMovePrefixRollback(t *testing.T) {
+	now := time.Now()
+	seed := map[string]mpEntry{
+		"a/1": {"v1", now.Add(time.Hour)},
+		"a/2": {"v2", time.Time{}},
+		"b/1": {"old1", now.Add(2 * time.Hour)}, // overwritten live target
+		"b/2": {"old2", now.Add(-time.Hour)},    // overwritten expired target
+	}
+	db := mpSeed(t, seed)
+	defer db.Close()
+	if err := db.CreateIndex("all", "*", IndexString); err != nil {
+		t.Fatal(err)
+	}
+	before := mpSnapshot(t, db)
+	// capture the physical expired occupant, invisible to live snapshots
+	var expiredExat time.Time
+	db.View(func(tx *Tx) error {
+		if dbi := tx.db.get("b/2"); dbi != nil && dbi.opts != nil {
+			expiredExat = dbi.opts.exat
+		}
+		return nil
+	})
+	if expiredExat.IsZero() {
+		t.Fatal("expired occupant not present in physical tree")
+	}
+
+	tx, err := db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := tx.MovePrefix("a/", "b/", true); err != nil || n != 2 {
+		t.Fatalf("move failed: n=%d err=%v", n, err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	// full restoration of values and absolute expirations
+	mpCompare(t, db, before)
+	db.View(func(tx *Tx) error {
+		dbi := tx.db.get("b/2")
+		if dbi == nil || dbi.val != "old2" || dbi.opts == nil ||
+			!dbi.opts.exat.Equal(expiredExat) {
+			t.Fatalf("expired overwritten target not restored: %+v", dbi)
+		}
+		dbi = tx.db.get("a/1")
+		if dbi == nil || !dbi.opts.exat.Equal(before["a/1"].exat) {
+			t.Fatalf("migrated item not restored with exat: %+v", dbi)
+		}
+		var n int
+		tx.Ascend("all", func(key, value string) bool { n++; return true })
+		if n != len(before) {
+			t.Fatalf("index not restored: %d entries", n)
+		}
+		return nil
+	})
+
+	// managed transaction returning an error auto-rolls back
+	if err := db.Update(func(tx *Tx) error {
+		if _, err := tx.MovePrefix("a/", "b/", true); err != nil {
+			return err
+		}
+		return errors.New("please rollback")
+	}); err == nil || err.Error() != "please rollback" {
+		t.Fatalf("expected rollback error, got %v", err)
+	}
+	mpCompare(t, db, before)
+
+	// DeleteAll followed by MovePrefix: rollback restores the whole snapshot
+	tx, err = db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.DeleteAll(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := tx.Set("z/1", "new", nil); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := tx.MovePrefix("z/", "y/", true); err != nil || n != 1 {
+		t.Fatalf("post-DeleteAll move failed: n=%d err=%v", n, err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	mpCompare(t, db, before)
+	db.View(func(tx *Tx) error {
+		var n int
+		tx.Ascend("all", func(key, value string) bool { n++; return true })
+		if n != len(before) {
+			t.Fatalf("indexes not restored after DeleteAll rollback: %d", n)
+		}
+		return nil
+	})
+}
+
+// TestMovePrefixIndexes ensures key pattern changes update secondary b-tree
+// indexes, spatial indexes and the expiration tree correctly, and that
+// rollback reverses those membership changes.
+func TestMovePrefixIndexes(t *testing.T) {
+	db, _ := Open(":memory:")
+	defer db.Close()
+	if err := db.CreateIndex("src", "mv:*", IndexString); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateIndex("dest", "gone:*", IndexString); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateSpatialIndex("points", "*", IndexRect); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if err := db.Update(func(tx *Tx) error {
+		for i := 1; i <= 5; i++ {
+			opts := &SetOptions{Expires: true, TTL: time.Until(now.Add(time.Hour))}
+			if _, _, err := tx.Set(fmt.Sprintf("mv:%d", i),
+				Point(float64(i), float64(i)), opts); err != nil {
+				return err
+			}
+		}
+		if _, _, err := tx.Set("gone:3", Point(99, 99), nil); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := tx.MovePrefix("mv:", "gone:", true); err != nil || n != 5 {
+		t.Fatalf("move failed: n=%d err=%v", n, err)
+	}
+	mpIndexState := func(t *testing.T, tx *Tx, index string) []string {
+		var keys []string
+		if err := tx.Ascend(index, func(key, value string) bool {
+			keys = append(keys, key)
+			return true
+		}); err != nil {
+			t.Fatal(err)
+		}
+		sort.Strings(keys)
+		return keys
+	}
+	if got := mpIndexState(t, tx, "src"); len(got) != 0 {
+		t.Fatalf("source index should be empty, got %v", got)
+	}
+	if got := mpIndexState(t, tx, "dest"); !mpSameStrings(got,
+		[]string{"gone:1", "gone:2", "gone:3", "gone:4", "gone:5"}) {
+		t.Fatalf("destination index mismatch: %v", got)
+	}
+	var spatial []string
+	if err := tx.Intersects("points",
+		Rect([]float64{-1e9, -1e9}, []float64{1e9, 1e9}),
+		func(key, value string) bool {
+			spatial = append(spatial, key)
+			return true
+		}); err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(spatial)
+	if !mpSameStrings(spatial,
+		[]string{"gone:1", "gone:2", "gone:3", "gone:4", "gone:5"}) {
+		t.Fatalf("spatial index mismatch: %v", spatial)
+	}
+	// expiration tree still tracks every moved item
+	if tx.db.exps.Len() != 5 {
+		t.Fatalf("exps tree len = %d, want 5", tx.db.exps.Len())
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	db.View(func(tx *Tx) error {
+		if got := mpIndexState(t, tx, "src"); !mpSameStrings(got,
+			[]string{"mv:1", "mv:2", "mv:3", "mv:4", "mv:5"}) {
+			t.Fatalf("source index not restored: %v", got)
+		}
+		if got := mpIndexState(t, tx, "dest"); !mpSameStrings(got, []string{"gone:3"}) {
+			t.Fatalf("destination index not restored: %v", got)
+		}
+		return nil
+	})
+}
+
+// TestMovePrefixSnapshotFuzz drives many randomized scenarios through both
+// the real implementation and the independent snapshot model, comparing all
+// keys, values and absolute expiration times.
+func TestMovePrefixSnapshotFuzz(t *testing.T) {
+	rng := rand.New(rand.NewSource(0x5eed))
+	comps := []string{"", "a/", "a/b/", "a/c/", "b/", "x\x00/"}
+	prefixes := []string{"", "a/", "a/b/", "b/", "a/c/", "z/", "a"}
+	for round := 0; round < 400; round++ {
+		seed := make(map[string]mpEntry)
+		for i := 0; i < 1+rng.Intn(14); i++ {
+			k := fmt.Sprintf("%s%d", comps[rng.Intn(len(comps))], rng.Intn(5))
+			if _, ok := seed[k]; ok {
+				continue
+			}
+			ent := mpEntry{val: fmt.Sprintf("v%d", rng.Intn(1000))}
+			switch rng.Intn(3) {
+			case 1:
+				ent.exat = time.Now().Add(time.Duration(1+rng.Intn(1000)) * time.Hour)
+			case 2:
+				ent.exat = time.Now().Add(-time.Duration(1+rng.Intn(100)) * time.Second)
+			}
+			seed[k] = ent
+		}
+		db := mpSeed(t, seed)
+		// independent snapshot of the actual live key space before the move
+		before := mpSnapshot(t, db)
+		src := prefixes[rng.Intn(len(prefixes))]
+		dst := prefixes[rng.Intn(len(prefixes))]
+		overwrite := rng.Intn(2) == 0
+		opNow := time.Now()
+		want, conflicts := mpModel(before, src, dst, overwrite, opNow)
+		n, err := mpMove(t, db, src, dst, overwrite)
+		var cerr *MovePrefixConflictError
+		if errors.As(err, &cerr) {
+			if overwrite || len(conflicts) == 0 {
+				t.Fatalf("round %d: unexpected conflict %v (src=%q dst=%q)",
+					round, cerr.Keys, src, dst)
+			}
+			if !mpSameStrings(cerr.Keys, conflicts) {
+				t.Fatalf("round %d: conflicts %v, model %v",
+					round, cerr.Keys, conflicts)
+			}
+			if n != 0 {
+				t.Fatalf("round %d: conflicted move reported %d", round, n)
+			}
+			mpCompare(t, db, before)
+		} else {
+			if err != nil {
+				t.Fatalf("round %d: %v", round, err)
+			}
+			mpCompare(t, db, want)
+			if src == dst {
+				if n != 0 {
+					t.Fatalf("round %d: no-op reported %d", round, n)
+				}
+			} else {
+				expected := 0
+				for k, ent := range before {
+					if strings.HasPrefix(k, src) &&
+						(ent.exat.IsZero() || !opNow.After(ent.exat)) {
+						expected++
+					}
+				}
+				if n != expected {
+					t.Fatalf("round %d: migrated %d, model counts %d",
+						round, n, expected)
+				}
+			}
+		}
+		db.Close()
+	}
+}
+
+// TestMovePrefixAOFReopen verifies that a committed move survives an AOF
+// close/reopen with the identical live key space, DEL entries included and
+// absolute expirations preserved at AOF (second) granularity.
+func TestMovePrefixAOFReopen(t *testing.T) {
+	dir, db := mpOpenFile(t)
+	defer os.RemoveAll(dir)
+	defer db.Close()
+	base := time.Now().Add(time.Hour).Truncate(time.Second)
+	seed := map[string]mpEntry{
+		"a/1": {"v1", base},
+		"a/2": {"v2", time.Time{}},
+		"b/1": {"old", base.Add(2 * time.Hour)},
+	}
+	mpSeedInto(t, db, seed)
+	// model input is the real pre-move key space; AOF stores Unix seconds,
+	// so truncate every expiration to whole seconds to match the reload
+	trunc := func(m map[string]mpEntry) map[string]mpEntry {
+		out := make(map[string]mpEntry, len(m))
+		for k, ent := range m {
+			if !ent.exat.IsZero() {
+				ent.exat = time.Unix(ent.exat.Unix(), 0)
+			}
+			out[k] = ent
+		}
+		return out
+	}
+	liveBefore := mpSnapshot(t, db)
+	before := trunc(liveBefore)
+
+	// a rejected move must leave no AOF trace
+	if _, err := mpMove(t, db, "a/", "b/", false); err == nil {
+		t.Fatal("expected conflict")
+	}
+	mpCompare(t, db, liveBefore)
+
+	if _, err := mpMove(t, db, "a/", "b/", true); err != nil {
+		t.Fatal(err)
+	}
+	want, _ := mpModel(before, "a/", "b/", true, time.Now())
+	db = mpReOpenFile(t, db)
+	defer db.Close()
+	mpCompare(t, db, want)
+	db.View(func(tx *Tx) error {
+		if _, err := tx.Get("a/1"); err != ErrNotFound {
+			t.Fatal("DEL for old source missing in AOF")
+		}
+		dur, err := tx.TTL("b/1")
+		if err != nil || dur <= 0 || dur > time.Hour {
+			t.Fatalf("absolute expiration not reloaded: dur=%v err=%v", dur, err)
+		}
+		return nil
+	})
+}
+
+// mpOpenFile opens a file-backed database in a unique temporary directory,
+// isolating MovePrefix persistence tests from the shared data.db path used by
+// the rest of the (rapid open/close cycling) suite on Windows.
+func mpOpenFile(t *testing.T) (string, *DB) {
+	t.Helper()
+	dir, err := ioutil.TempDir("", "buntdb-moveprefix-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := Open(filepath.Join(dir, "mp.db"))
+	if err != nil {
+		os.RemoveAll(dir)
+		t.Fatal(err)
+	}
+	return dir, db
+}
+
+func mpReOpenFile(t *testing.T, db *DB) *DB {
+	t.Helper()
+	path := db.file.Name()
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return db
+}
+
+// mpSeedInto fills an already opened database.
+func mpSeedInto(t *testing.T, db *DB, items map[string]mpEntry) {
+	t.Helper()
+	if err := db.Update(func(tx *Tx) error {
+		for _, k := range mpSortedKeys(items) {
+			ent := items[k]
+			var opts *SetOptions
+			if !ent.exat.IsZero() {
+				opts = &SetOptions{Expires: true, TTL: time.Until(ent.exat)}
+			}
+			if _, _, err := tx.Set(k, ent.val, opts); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestMovePrefixMixedWrites combines a plain Set and a MovePrefix in one
+// transaction and then rolls back, ensuring the earliest pre-transaction
+// state wins for every touched key.
+func TestMovePrefixMixedWrites(t *testing.T) {
+	db := mpSeed(t, map[string]mpEntry{
+		"a/1": {"old", time.Time{}},
+		"a/2": {"v2", time.Time{}},
+	})
+	defer db.Close()
+	err := db.Update(func(tx *Tx) error {
+		if _, _, err := tx.Set("a/1", "new", nil); err != nil {
+			return err
+		}
+		n, err := tx.MovePrefix("a/", "b/", true)
+		if err != nil {
+			return err
+		}
+		if n != 2 {
+			t.Fatalf("expected 2 moved, got %d", n)
+		}
+		if v, _ := tx.Get("b/1"); v != "new" {
+			t.Fatalf("b/1 = %q, want new", v)
+		}
+		if v, _ := tx.Get("b/2"); v != "v2" {
+			t.Fatalf("b/2 = %q, want v2", v)
+		}
+		return errors.New("rollback please")
+	})
+	if err == nil || err.Error() != "rollback please" {
+		t.Fatalf("expected rollback error, got %v", err)
+	}
+	db.View(func(tx *Tx) error {
+		if v, _ := tx.Get("a/1"); v != "old" {
+			t.Fatalf("a/1 = %q, want pre-tx value old", v)
+		}
+		if v, _ := tx.Get("a/2"); v != "v2" {
+			t.Fatalf("a/2 = %q", v)
+		}
+		if _, err := tx.Get("b/1"); err != ErrNotFound {
+			t.Fatal("b/1 leaked past rollback")
+		}
+		return nil
+	})
+}
+
+// TestMovePrefixGuards covers transaction-state guard rails.
+func TestMovePrefixGuards(t *testing.T) {
+	seed := map[string]mpEntry{"a/1": {"v", time.Time{}}, "b/1": {"x", time.Time{}}}
+	db := mpSeed(t, seed)
+	defer db.Close()
+
+	// read-only transaction
+	if err := db.View(func(tx *Tx) error {
+		_, err := tx.MovePrefix("a/", "c/", true)
+		return err
+	}); err != ErrTxNotWritable {
+		t.Fatalf("expected ErrTxNotWritable, got %v", err)
+	}
+
+	// Set/Delete while iterating is forbidden: MovePrefix must refuse too
+	before := mpSnapshot(t, db)
+	err := db.Update(func(tx *Tx) error {
+		return tx.Ascend("", func(key, value string) bool {
+			if _, err := tx.MovePrefix("a/", "c/", true); err != ErrTxIterating {
+				t.Fatalf("expected ErrTxIterating, got %v", err)
+			}
+			return false
+		})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mpCompare(t, db, before)
+
+	// closed transaction
+	tx, err := db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.MovePrefix("a/", "c/", true); err != ErrTxClosed {
+		t.Fatalf("expected ErrTxClosed, got %v", err)
+	}
+}
+
+// TestMovePrefixCommitWriteFailure forces the AOF write to fail and asserts
+// that the in-memory rollback restores every migrated and overwritten record.
+func TestMovePrefixCommitWriteFailure(t *testing.T) {
+	dir, db := mpOpenFile(t)
+	defer os.RemoveAll(dir)
+	defer db.Close()
+	now := time.Now()
+	seed := map[string]mpEntry{
+		"a/1": {"v1", now.Add(time.Hour)},
+		"a/2": {"v2", time.Time{}},
+		"b/1": {"old", now.Add(2 * time.Hour)},
+	}
+	mpSeedInto(t, db, seed)
+	before := mpSnapshot(t, db)
+
+	failFile, err := os.Create(filepath.Join(dir, "fail.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// a closed handle makes every subsequent write fail on every platform
+	if err := failFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := tx.MovePrefix("a/", "b/", true); err != nil || n != 2 {
+		t.Fatalf("move failed: n=%d err=%v", n, err)
+	}
+	origFile := db.file
+	db.file = failFile // tx already owns the write lock
+	commitErr := tx.Commit()
+	if commitErr == nil {
+		t.Fatal("expected a commit write failure")
+	}
+	db.mu.Lock()
+	db.file = origFile
+	db.mu.Unlock()
+	mpCompare(t, db, before)
 }
