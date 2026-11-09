@@ -2958,3 +2958,960 @@ func TestIssue112(t *testing.T) {
 		return err
 	})
 }
+
+// ---- ScanIntervals ----
+
+// openMemDB opens an isolated in-memory database so that these tests do not
+// contend for the shared on-disk data.db file used by the other tests.
+func openMemDB(t *testing.T) *DB {
+	db, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return db
+}
+
+type kvPair struct {
+	k, v string
+}
+
+func scanIntervalsCollect(tx *Tx, index string, ivs []Interval,
+	desc bool) ([]kvPair, error) {
+	var got []kvPair
+	err := tx.ScanIntervals(index, ivs, desc, func(key, value string) bool {
+		got = append(got, kvPair{key, value})
+		return true
+	})
+	return got, err
+}
+
+// modelIntervals is an independent reference implementation: it computes the
+// union of the intervals as sets, de-duplicates by primary key (never by
+// value string) and sorts the result by (ordered component, key).
+func modelIntervals(recs []kvPair, comp func(a, b string) bool,
+	ord func(kvPair) string, ivs []Interval, desc bool) []kvPair {
+	var out []kvPair
+	for _, r := range recs {
+		x := ord(r)
+		for _, iv := range ivs {
+			okLo := iv.MinUnbounded ||
+				(!iv.MinOpen && !comp(x, iv.Min)) || // x >= Min
+				(iv.MinOpen && comp(iv.Min, x)) // Min < x
+			okHi := iv.MaxUnbounded ||
+				(!iv.MaxOpen && !comp(iv.Max, x)) || // x <= Max
+				(iv.MaxOpen && comp(x, iv.Max)) // x < Max
+			if okLo && okHi {
+				out = append(out, r)
+				break
+			}
+		}
+	}
+	sortPairs(out, comp, ord)
+	if desc {
+		for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+			out[i], out[j] = out[j], out[i]
+		}
+	}
+	return out
+}
+
+func sortPairs(out []kvPair, comp func(a, b string) bool,
+	ord func(kvPair) string) {
+	for i := 1; i < len(out); i++ {
+		for j := i; j > 0; j-- {
+			xi, xj := ord(out[j-1]), ord(out[j])
+			if comp(xi, xj) || (!comp(xj, xi) && out[j-1].k < out[j].k) {
+				break
+			}
+			out[j-1], out[j] = out[j], out[j-1]
+		}
+	}
+}
+
+func pairsEqual(a, b []kvPair) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func mustSet(t *testing.T, tx *Tx, key, val string, opts *SetOptions) {
+	if _, _, err := tx.Set(key, val, opts); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestScanIntervalsEndpoints enumerates every open/closed/unbounded endpoint
+// combination on the keys tree and on an ordered index, in both directions,
+// and compares the output with the independent set-union model.
+func TestScanIntervalsEndpoints(t *testing.T) {
+	db := openMemDB(t)
+	defer db.Close()
+	keyRecs := []kvPair{
+		{"", "v-"}, {"a", "v-a"}, {"b", "v-b"}, {"c", "v-c"},
+		{"d", "v-d"}, {"e", "v-e"},
+	}
+	intRecs := []kvPair{
+		{"n0", "0"}, {"n1a", "1"}, {"n1b", "1"}, {"n2", "2"},
+		{"n5", "5"}, {"n6", "6"}, {"n7", "7"}, {"n9", "9"},
+	}
+	if err := db.Update(func(tx *Tx) error {
+		if err := tx.CreateIndex("num", "*", IndexInt); err != nil {
+			return err
+		}
+		for _, r := range keyRecs {
+			mustSet(t, tx, r.k, r.v, nil)
+		}
+		for _, r := range intRecs {
+			mustSet(t, tx, r.k, r.v, nil)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, desc := range []bool{false, true} {
+		for loUnb := 0; loUnb < 2; loUnb++ {
+			for loOpen := 0; loOpen < 2; loOpen++ {
+				for hiUnb := 0; hiUnb < 2; hiUnb++ {
+					for hiOpen := 0; hiOpen < 2; hiOpen++ {
+						iv := Interval{
+							Min:          "b",
+							Max:          "d",
+							MinOpen:      loOpen == 1,
+							MaxOpen:      hiOpen == 1,
+							MinUnbounded: loUnb == 1,
+							MaxUnbounded: hiUnb == 1,
+						}
+						allRecs := append(append([]kvPair{}, keyRecs...),
+							intRecs...)
+						exp := modelIntervals(allRecs, IndexBinary,
+							func(r kvPair) string { return r.k },
+							[]Interval{iv}, desc)
+						if err := db.View(func(tx *Tx) error {
+							got, err := scanIntervalsCollect(tx, "", []Interval{iv}, desc)
+							if err != nil {
+								return err
+							}
+							if !pairsEqual(got, exp) {
+								t.Fatalf("keys desc=%v iv=%+v\n got %v\n exp %v",
+									desc, iv, got, exp)
+							}
+							return nil
+						}); err != nil {
+							t.Fatal(err)
+						}
+
+						iv2 := iv
+						iv2.Min, iv2.Max = "2", "6"
+						exp2 := modelIntervals(allRecs, IndexInt,
+							func(r kvPair) string { return r.v },
+							[]Interval{iv2}, desc)
+						if err := db.View(func(tx *Tx) error {
+							got, err := scanIntervalsCollect(tx, "num",
+								[]Interval{iv2}, desc)
+							if err != nil {
+								return err
+							}
+							if !pairsEqual(got, exp2) {
+								t.Fatalf("num desc=%v iv=%+v\n got %v\n exp %v",
+									desc, iv2, got, exp2)
+							}
+							return nil
+						}); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestScanIntervalsEquivalenceClass verifies that an index endpoint denotes a
+// whole value equivalence class and bounds which compare equal but have
+// different bytes select the same class. Keys within a class keep key order.
+func TestScanIntervalsEquivalenceClass(t *testing.T) {
+	db := openMemDB(t)
+	defer db.Close()
+	recs := []kvPair{
+		{"a1", "a"}, {"a2", "A"}, {"b1", "B"}, {"b2", "b"}, {"c1", "c"},
+	}
+	if err := db.Update(func(tx *Tx) error {
+		if err := tx.CreateIndex("ci", "*", IndexString); err != nil {
+			return err
+		}
+		for _, r := range recs {
+			mustSet(t, tx, r.k, r.v, nil)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	check := func(name string, iv Interval, desc bool, want []kvPair) {
+		t.Helper()
+		if err := db.View(func(tx *Tx) error {
+			got, err := scanIntervalsCollect(tx, "ci", []Interval{iv}, desc)
+			if err != nil {
+				return err
+			}
+			if !pairsEqual(got, want) {
+				t.Fatalf("%s: got %v want %v", name, got, want)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Closed-closed over byte-different bounds: both full classes.
+	check("closed bytes diff asc", Interval{Min: "A", Max: "b"}, false,
+		[]kvPair{{"a1", "a"}, {"a2", "A"}, {"b1", "B"}, {"b2", "b"}})
+	check("closed bytes diff desc", Interval{Min: "A", Max: "b"}, true,
+		[]kvPair{{"b2", "b"}, {"b1", "B"}, {"a2", "A"}, {"a1", "a"}})
+	// Open lower bound excludes the whole lower class.
+	check("open lower", Interval{Min: "A", Max: "b", MinOpen: true}, false,
+		[]kvPair{{"b1", "B"}, {"b2", "b"}})
+	// Open upper bound excludes the whole upper class.
+	check("open upper", Interval{Min: "A", Max: "b", MaxOpen: true}, false,
+		[]kvPair{{"a1", "a"}, {"a2", "A"}})
+	// Equivalent closed bounds select the single class in key order.
+	check("same class closed", Interval{Min: "A", Max: "a"}, false,
+		[]kvPair{{"a1", "a"}, {"a2", "A"}})
+	check("same class closed desc", Interval{Min: "a", Max: "A"}, true,
+		[]kvPair{{"a2", "A"}, {"a1", "a"}})
+	// Any open side on an equal-class interval yields nothing.
+	check("same class lo open", Interval{Min: "a", Max: "A", MinOpen: true},
+		false, nil)
+	check("same class hi open", Interval{Min: "A", Max: "a", MaxOpen: true},
+		false, nil)
+	// A single interval spanning byte-different bounds covers both classes
+	// in full, in complete reverse order when descending.
+	check("two classes desc",
+		Interval{Min: "A", Max: "B"}, true,
+		[]kvPair{{"b2", "b"}, {"b1", "B"}, {"a2", "A"}, {"a1", "a"}})
+	// Two intervals that meet on a class included by one side must not
+	// duplicate that class even though the bounds have different bytes.
+	if err := db.View(func(tx *Tx) error {
+		got, err := scanIntervalsCollect(tx, "ci", []Interval{
+			{Min: "A", Max: "B"},                // [a,b]
+			{Min: "b", Max: "c", MinOpen: true}, // (b,c]
+		}, false)
+		if err != nil {
+			return err
+		}
+		if !pairsEqual(got, []kvPair{
+			{"a1", "a"}, {"a2", "A"}, {"b1", "B"}, {"b2", "b"}, {"c1", "c"},
+		}) {
+			t.Fatalf("touching union: %v", got)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestScanIntervalsNormalize exercises the normalization and merging rules
+// directly.
+func TestScanIntervalsNormalize(t *testing.T) {
+	count := func(less func(a, b string) bool, ivs []Interval) int {
+		return len(normalizeScanIntervals(less, ivs))
+	}
+	bounded := func(min, max string, mo, xo bool) Interval {
+		return Interval{Min: min, Max: max, MinOpen: mo, MaxOpen: xo}
+	}
+	// Reversed intervals and open point intervals are dropped.
+	if n := count(IndexBinary, []Interval{bounded("d", "b", false, false)}); n != 0 {
+		t.Fatalf("reversed interval should be empty, got %d", n)
+	}
+	if n := count(IndexBinary, []Interval{bounded("b", "b", true, false)}); n != 0 {
+		t.Fatalf("[b,b) should be empty, got %d", n)
+	}
+	if n := count(IndexBinary, []Interval{bounded("b", "b", false, true)}); n != 0 {
+		t.Fatalf("(b,b] should be empty, got %d", n)
+	}
+	if n := count(IndexBinary, []Interval{bounded("b", "b", true, true)}); n != 0 {
+		t.Fatalf("(b,b) should be empty, got %d", n)
+	}
+	if n := count(IndexBinary, []Interval{bounded("b", "b", false, false)}); n != 1 {
+		t.Fatalf("[b,b] should keep one class, got %d", n)
+	}
+	// Touching class excluded from both sides stays separate.
+	if n := count(IndexBinary, []Interval{
+		bounded("b", "d", false, true),
+		bounded("d", "f", true, false),
+	}); n != 2 {
+		t.Fatalf("open-open touching intervals should stay separate, got %d", n)
+	}
+	// Either side includes the touching class: merged.
+	if n := count(IndexBinary, []Interval{
+		bounded("b", "d", false, false),
+		bounded("d", "f", true, false),
+	}); n != 1 {
+		t.Fatalf("closed-open touching intervals should merge, got %d", n)
+	}
+	if n := count(IndexBinary, []Interval{
+		bounded("b", "d", false, true),
+		bounded("d", "f", false, false),
+	}); n != 1 {
+		t.Fatalf("open-closed touching intervals should merge, got %d", n)
+	}
+	// Duplicate and nested intervals collapse into one.
+	if n := count(IndexBinary, []Interval{
+		bounded("b", "f", false, false),
+		bounded("b", "f", false, false),
+		bounded("c", "e", false, false),
+	}); n != 1 {
+		t.Fatalf("duplicate/nested intervals should merge into one, got %d", n)
+	}
+	// Overlapping intervals merge.
+	if n := count(IndexBinary, []Interval{
+		bounded("b", "e", false, false),
+		bounded("d", "h", false, false),
+	}); n != 1 {
+		t.Fatalf("overlapping intervals should merge, got %d", n)
+	}
+	// Comparator-equivalent but byte-different bounds act as one class.
+	if n := count(IndexString, []Interval{
+		bounded("A", "a", false, false),
+		bounded("a", "A", false, false),
+	}); n != 1 {
+		t.Fatalf("equivalent bounds should merge to a single class, got %d", n)
+	}
+	// Two intervals joined only through an included equivalent class merge
+	// even though the bytes differ.
+	if n := count(IndexString, []Interval{
+		bounded("A", "B", false, false),
+		bounded("b", "c", false, false),
+	}); n != 1 {
+		t.Fatalf("intervals touching on an included class should merge, got %d", n)
+	}
+	// Both sides exclude the shared equivalent class: stay separate.
+	if n := count(IndexString, []Interval{
+		bounded("A", "B", false, true),
+		bounded("b", "c", true, false),
+	}); n != 2 {
+		t.Fatalf("class excluded from both sides should stay separate, got %d", n)
+	}
+	// Unbounded sides merge with everything.
+	if n := count(IndexBinary, []Interval{
+		{Max: "d", MinUnbounded: true}, // [-inf,d]
+		{Min: "c", MaxUnbounded: true}, // [c,+inf]
+	}); n != 1 {
+		t.Fatalf("[-inf,d] and [c,+inf] should merge, got %d", n)
+	}
+	// The fully unbounded interval absorbs everything.
+	if n := count(IndexBinary, []Interval{
+		{MinUnbounded: true, MaxUnbounded: true},
+		bounded("b", "d", false, false),
+	}); n != 1 {
+		t.Fatalf("fully unbounded interval should absorb the rest, got %d", n)
+	}
+}
+
+// TestScanIntervalsEmptyString makes sure empty keys, values and bounds are
+// treated as real data, while only the unbounded markers remove a side.
+func TestScanIntervalsEmptyString(t *testing.T) {
+	db := openMemDB(t)
+	defer db.Close()
+	recs := []kvPair{{"", "z"}, {"a", ""}, {"b", "x"}}
+	if err := db.Update(func(tx *Tx) error {
+		if err := tx.CreateIndex("vals", "*", IndexBinary); err != nil {
+			return err
+		}
+		for _, r := range recs {
+			mustSet(t, tx, r.k, r.v, nil)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Keys tree: closed bound at "" includes the empty key, open excludes it.
+	keyIvClosed := []Interval{{Min: "", Max: "b"}}
+	keyIvOpen := []Interval{{Min: "", Max: "b", MinOpen: true}}
+	wantKeysClosed := modelIntervals(recs, IndexBinary,
+		func(r kvPair) string { return r.k }, keyIvClosed, false)
+	wantKeysOpen := modelIntervals(recs, IndexBinary,
+		func(r kvPair) string { return r.k }, keyIvOpen, false)
+	// Index: the empty value equivalence class (key "a") is real data.
+	valIvClosed := []Interval{{Min: "", Max: "z"}}
+	valIvOpen := []Interval{{Min: "", Max: "z", MinOpen: true}}
+	wantValsClosed := modelIntervals(recs, IndexBinary,
+		func(r kvPair) string { return r.v }, valIvClosed, false)
+	wantValsOpen := modelIntervals(recs, IndexBinary,
+		func(r kvPair) string { return r.v }, valIvOpen, false)
+	if err := db.View(func(tx *Tx) error {
+		got, err := scanIntervalsCollect(tx, "", keyIvClosed, false)
+		if err != nil {
+			return err
+		}
+		if !pairsEqual(got, wantKeysClosed) {
+			t.Fatalf("closed empty lower: got %v want %v", got, wantKeysClosed)
+		}
+		if len(wantKeysClosed) != 3 {
+			t.Fatalf("closed [\",b] should include the empty key, got %v",
+				wantKeysClosed)
+		}
+		got, err = scanIntervalsCollect(tx, "", keyIvOpen, false)
+		if err != nil {
+			return err
+		}
+		if !pairsEqual(got, wantKeysOpen) {
+			t.Fatalf("open empty lower: got %v want %v", got, wantKeysOpen)
+		}
+		for _, p := range wantKeysOpen {
+			if p.k == "" {
+				t.Fatalf("open empty lower must exclude the empty key: %v",
+					wantKeysOpen)
+			}
+		}
+		got, err = scanIntervalsCollect(tx, "vals", valIvClosed, false)
+		if err != nil {
+			return err
+		}
+		if !pairsEqual(got, wantValsClosed) {
+			t.Fatalf("index closed empty lower: got %v want %v",
+				got, wantValsClosed)
+		}
+		var sawEmptyVal bool
+		for _, p := range wantValsClosed {
+			if p.v == "" {
+				sawEmptyVal = true
+			}
+		}
+		if !sawEmptyVal {
+			t.Fatalf("closed [\",z] should include the empty value class")
+		}
+		got, err = scanIntervalsCollect(tx, "vals", valIvOpen, false)
+		if err != nil {
+			return err
+		}
+		if !pairsEqual(got, wantValsOpen) {
+			t.Fatalf("index open empty lower: got %v want %v",
+				got, wantValsOpen)
+		}
+		for _, p := range wantValsOpen {
+			if p.v == "" {
+				t.Fatalf("open empty lower must exclude the empty value class")
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestScanIntervalsUnbounded verifies that a fully unbounded interval behaves
+// exactly like Ascend/Descend, including the complete reverse order.
+func TestScanIntervalsUnbounded(t *testing.T) {
+	db := openMemDB(t)
+	defer db.Close()
+	var recs []kvPair
+	if err := db.Update(func(tx *Tx) error {
+		for _, k := range []string{"", "a", "b", "c", "d"} {
+			mustSet(t, tx, k, "v"+k, nil)
+			recs = append(recs, kvPair{k, "v" + k})
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	all := Interval{MinUnbounded: true, MaxUnbounded: true}
+	for _, desc := range []bool{false, true} {
+		var want []kvPair
+		if err := db.View(func(tx *Tx) error {
+			return tx.Ascend("", func(k, v string) bool {
+				want = append(want, kvPair{k, v})
+				return true
+			})
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if desc {
+			for i, j := 0, len(want)-1; i < j; i, j = i+1, j-1 {
+				want[i], want[j] = want[j], want[i]
+			}
+		}
+		if err := db.View(func(tx *Tx) error {
+			got, err := scanIntervalsCollect(tx, "", []Interval{all}, desc)
+			if err != nil {
+				return err
+			}
+			if !pairsEqual(got, want) {
+				t.Fatalf("unbounded desc=%v: got %v want %v", desc, got, want)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestScanIntervalsDuplicates verifies that overlapping, duplicate and nested
+// intervals never report a record twice, while distinct keys with equal
+// values are all reported.
+func TestScanIntervalsDuplicates(t *testing.T) {
+	db := openMemDB(t)
+	defer db.Close()
+	var recs []kvPair
+	if err := db.Update(func(tx *Tx) error {
+		if err := tx.CreateIndex("num", "*", IndexInt); err != nil {
+			return err
+		}
+		for _, r := range []kvPair{
+			{"k0", "0"}, {"k1a", "1"}, {"k1b", "1"}, {"k2", "2"},
+			{"k4", "4"}, {"k6", "6"}, {"k8", "8"}, {"k9", "9"},
+		} {
+			mustSet(t, tx, r.k, r.v, nil)
+			recs = append(recs, r)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ivs := []Interval{
+		{Min: "1", Max: "6"}, // [1,6]
+		{Min: "1", Max: "6"}, // exact duplicate
+		{Min: "2", Max: "4"}, // nested
+		{Min: "4", Max: "8", MinOpen: true, MaxOpen: true}, // (4,8)
+		{Min: "8", Max: "9"}, // touches previous open side at 8
+	}
+	exp := modelIntervals(recs, IndexInt, func(r kvPair) string { return r.v },
+		ivs, false)
+	if err := db.View(func(tx *Tx) error {
+		got, err := scanIntervalsCollect(tx, "num", ivs, false)
+		if err != nil {
+			return err
+		}
+		if !pairsEqual(got, exp) {
+			t.Fatalf("got %v want %v", got, exp)
+		}
+		seen := make(map[string]int)
+		for _, p := range got {
+			seen[p.k]++
+		}
+		for k, n := range seen {
+			if n != 1 {
+				t.Fatalf("key %s reported %d times", k, n)
+			}
+		}
+		// The two distinct keys at value class 1 must both be present.
+		if seen["k1a"] != 1 || seen["k1b"] != 1 {
+			t.Fatalf("equal value class not fully reported: %v", seen)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestScanIntervalsEarlyStop verifies that returning false stops the scan at
+// once and later intervals are never visited.
+func TestScanIntervalsEarlyStop(t *testing.T) {
+	db := openMemDB(t)
+	defer db.Close()
+	if err := db.Update(func(tx *Tx) error {
+		for _, k := range []string{"a", "b", "e", "f"} {
+			mustSet(t, tx, k, "v", nil)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ivs := []Interval{
+		{Min: "a", Max: "b"}, // [a,b]
+		{Min: "e", Max: "f"}, // [e,f], must never be reached
+	}
+	var got []string
+	var calls int
+	err := db.View(func(tx *Tx) error {
+		return tx.ScanIntervals("", ivs, false, func(key, value string) bool {
+			calls++
+			got = append(got, key)
+			return false
+		})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 || len(got) != 1 || got[0] != "a" {
+		t.Fatalf("expected a single 'a' callback, got %v (%d calls)", got, calls)
+	}
+}
+
+// TestScanIntervalsErrors verifies invalid indexes, spatial indexes and
+// closed transactions error out before any callback happens.
+func TestScanIntervalsErrors(t *testing.T) {
+	db := openMemDB(t)
+	defer db.Close()
+	if err := db.Update(func(tx *Tx) error {
+		mustSet(t, tx, "a", "1", nil)
+		return tx.CreateSpatialIndex("geo", "*", IndexRect)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	all := []Interval{{MinUnbounded: true, MaxUnbounded: true}}
+	calls := 0
+	scan := func(tx *Tx, index string) error {
+		return tx.ScanIntervals(index, all, false,
+			func(key, value string) bool {
+				calls++
+				return true
+			})
+	}
+	if err := db.View(func(tx *Tx) error {
+		if err := scan(tx, "missing"); err != ErrNotFound {
+			t.Fatalf("expected ErrNotFound, got %v", err)
+		}
+		if err := scan(tx, "geo"); err != ErrInvalidOperation {
+			t.Fatalf("expected ErrInvalidOperation, got %v", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 0 {
+		t.Fatalf("no callback expected on error, got %d", calls)
+	}
+	tx, err := db.Begin(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.ScanIntervals("", all, false,
+		func(key, value string) bool { return true }); err != ErrTxClosed {
+		t.Fatalf("expected ErrTxClosed, got %v", err)
+	}
+	// An invalid index is reported even with an empty interval list.
+	if err := db.View(func(tx *Tx) error {
+		err := tx.ScanIntervals("missing", nil, false,
+			func(key, value string) bool {
+				t.Fatal("should not be called")
+				return true
+			})
+		if err != ErrNotFound {
+			t.Fatalf("expected ErrNotFound for empty list, got %v", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// An empty list on a valid index never calls back and never errors.
+	if err := db.View(func(tx *Tx) error {
+		return tx.ScanIntervals("", nil, false,
+			func(key, value string) bool {
+				t.Fatal("should not be called")
+				return true
+			})
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestScanIntervalsIterGuard verifies the iteration protection: writes fail
+// with ErrTxIterating, nested reads work, and a panicking callback restores
+// the iteration counter.
+func TestScanIntervalsIterGuard(t *testing.T) {
+	db := openMemDB(t)
+	defer db.Close()
+	if err := db.Update(func(tx *Tx) error {
+		for _, k := range []string{"a", "b", "c"} {
+			mustSet(t, tx, k, "v", nil)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	all := []Interval{{MinUnbounded: true, MaxUnbounded: true}}
+	if err := db.Update(func(tx *Tx) error {
+		return tx.ScanIntervals("", all, false, func(key, value string) bool {
+			if _, _, err := tx.Set("z", "1", nil); err != ErrTxIterating {
+				t.Fatalf("Set: expected ErrTxIterating, got %v", err)
+			}
+			if _, err := tx.Delete(key); err != ErrTxIterating {
+				t.Fatalf("Delete: expected ErrTxIterating, got %v", err)
+			}
+			// Nested reads are permitted and share the iteration guard.
+			if _, err := tx.Get(key); err != nil {
+				t.Fatalf("nested Get failed: %v", err)
+			}
+			nested := 0
+			if err := tx.Ascend("", func(k2, v2 string) bool {
+				if _, _, err := tx.Set("z", "1", nil); err != ErrTxIterating {
+					t.Fatalf("nested Set: expected ErrTxIterating, got %v", err)
+				}
+				nested++
+				return true
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if nested != 3 {
+				t.Fatalf("nested ascend visited %d items", nested)
+			}
+			return true
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Manual writable transaction to observe panic recovery.
+	tx, err := db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	func() {
+		defer func() { _ = recover() }()
+		_ = tx.ScanIntervals("", all, false, func(key, value string) bool {
+			panic("boom")
+		})
+	}()
+	if tx.wc.itercount != 0 {
+		t.Fatalf("itercount should be restored after panic, got %d",
+			tx.wc.itercount)
+	}
+	if _, _, err := tx.Set("after", "panic", nil); err != nil {
+		t.Fatalf("Set after panic should succeed, got %v", err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestScanIntervalsTTL verifies expired items are skipped using one captured
+// time, consistently for the whole call.
+func TestScanIntervalsTTL(t *testing.T) {
+	db := openMemDB(t)
+	defer db.Close()
+	if err := db.Update(func(tx *Tx) error {
+		mustSet(t, tx, "expired", "v",
+			&SetOptions{Expires: true, TTL: -time.Second})
+		mustSet(t, tx, "live", "v", nil)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	all := []Interval{{MinUnbounded: true, MaxUnbounded: true}}
+	if err := db.View(func(tx *Tx) error {
+		got, err := scanIntervalsCollect(tx, "", all, false)
+		if err != nil {
+			return err
+		}
+		if !pairsEqual(got, []kvPair{{"live", "v"}}) {
+			t.Fatalf("expired item should be filtered, got %v", got)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// An item that expires while the callback is running is still reported
+	// because expiration is evaluated against a single captured time.
+	if err := db.Update(func(tx *Tx) error {
+		mustSet(t, tx, "a-dying", "v",
+			&SetOptions{Expires: true, TTL: 120 * time.Millisecond})
+		mustSet(t, tx, "b-live", "v", nil)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(70 * time.Millisecond)
+	var got []kvPair
+	if err := db.View(func(tx *Tx) error {
+		var e error
+		e = tx.ScanIntervals("", all, false, func(key, value string) bool {
+			time.Sleep(80 * time.Millisecond)
+			got = append(got, kvPair{key, value})
+			return true
+		})
+		return e
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("expected all three items via captured time, got %v", got)
+	}
+}
+
+// TestScanIntervalsGapProof shows via comparator call counting that the scan
+// seeks to each interval and never traverses the large non-matching gap.
+func TestScanIntervalsGapProof(t *testing.T) {
+	db := openMemDB(t)
+	defer db.Close()
+	cmpCalls := 0
+	countingLess := func(a, b string) bool {
+		cmpCalls++
+		return IndexInt(a, b)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		if err := tx.CreateIndex("num", "*", countingLess); err != nil {
+			return err
+		}
+		mustSet(t, tx, "hit:10:0", "10", nil)
+		mustSet(t, tx, "hit:10:1", "10", nil)
+		for v := 1000; v < 9000; v++ {
+			mustSet(t, tx, fmt.Sprintf("gap:%d", v), strconv.Itoa(v), nil)
+		}
+		mustSet(t, tx, "hit:9000:0", "9000", nil)
+		mustSet(t, tx, "hit:9000:1", "9000", nil)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Sanity: a plain range scan walks the whole gap and the counting
+	// comparator must reflect that, proving the metric detects traversal.
+	if err := db.View(func(tx *Tx) error {
+		cmpCalls = 0
+		return tx.AscendRange("num", "10", "9001",
+			func(key, value string) bool { return true })
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if cmpCalls < 7000 {
+		t.Fatalf("range scan should compare across the gap, calls=%d", cmpCalls)
+	}
+	// ScanIntervals on two tiny intervals far apart: only bounded seeks and
+	// boundary checks happen, so the comparator is barely used.
+	var got []kvPair
+	if err := db.View(func(tx *Tx) error {
+		cmpCalls = 0
+		var e error
+		got, e = scanIntervalsCollect(tx, "num", []Interval{
+			{Min: "10", Max: "10"},
+			{Min: "9000", Max: "9000"},
+		}, false)
+		return e
+	}); err != nil {
+		t.Fatal(err)
+	}
+	want := []kvPair{
+		{"hit:10:0", "10"}, {"hit:10:1", "10"},
+		{"hit:9000:0", "9000"}, {"hit:9000:1", "9000"},
+	}
+	if !pairsEqual(got, want) {
+		t.Fatalf("got %v want %v", got, want)
+	}
+	if cmpCalls >= 500 {
+		t.Fatalf("expected bounded seeks only, comparator calls=%d", cmpCalls)
+	}
+	if cmpCalls >= 7000 {
+		t.Fatalf("scan traversed the gap: comparator calls=%d", cmpCalls)
+	}
+	// Descending intervals must seek just as precisely, in full reverse.
+	var gotDesc []kvPair
+	if err := db.View(func(tx *Tx) error {
+		cmpCalls = 0
+		var e error
+		gotDesc, e = scanIntervalsCollect(tx, "num", []Interval{
+			{Min: "10", Max: "10"},
+			{Min: "9000", Max: "9000"},
+		}, true)
+		return e
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !pairsEqual(gotDesc, []kvPair{
+		{"hit:9000:1", "9000"}, {"hit:9000:0", "9000"},
+		{"hit:10:1", "10"}, {"hit:10:0", "10"},
+	}) {
+		t.Fatalf("desc got %v", gotDesc)
+	}
+	if cmpCalls >= 500 {
+		t.Fatalf("desc expected bounded seeks only, comparator calls=%d",
+			cmpCalls)
+	}
+}
+
+// TestScanIntervalsModel runs many randomized interval sets against the
+// independent set-union model, on the keys tree, a case-insensitive index and
+// an integer index, in both directions.
+func TestScanIntervalsModel(t *testing.T) {
+	db := openMemDB(t)
+	defer db.Close()
+	keysRecs := []kvPair{
+		{"", ""}, {"A", "VA"}, {"a", "va"}, {"B", "VB"}, {"b", "vb"},
+		{"c", "vc"}, {"d", "vd"}, {"e", "ve"}, {"z", "vz"},
+	}
+	intRecs := []kvPair{
+		{"i0a", "0"}, {"i0b", "0"}, {"i1", "1"}, {"i2", "2"},
+		{"i3a", "3"}, {"i3b", "3"}, {"i5", "5"}, {"i7", "7"},
+		{"i9", "9"}, {"i10", "10"}, {"i20", "20"},
+	}
+	if err := db.Update(func(tx *Tx) error {
+		if err := tx.CreateIndex("ci", "*", IndexString); err != nil {
+			return err
+		}
+		if err := tx.CreateIndex("num", "*", IndexInt); err != nil {
+			return err
+		}
+		for _, r := range keysRecs {
+			mustSet(t, tx, r.k, r.v, nil)
+		}
+		for _, r := range intRecs {
+			mustSet(t, tx, r.k, r.v, nil)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Both indexes use the "*" pattern, so every record lives in every tree.
+	allRecs := append(append([]kvPair{}, keysRecs...), intRecs...)
+	type cfg struct {
+		index string
+		recs  []kvPair
+		comp  func(a, b string) bool
+		ord   func(kvPair) string
+		pool  []string
+	}
+	cfgs := []cfg{
+		{"", allRecs, IndexBinary, func(r kvPair) string { return r.k },
+			[]string{"", "a", "A", "b", "c", "d", "e", "y", "z"}},
+		{"ci", allRecs, IndexString, func(r kvPair) string { return r.v },
+			[]string{"", "va", "VA", "vb", "vc", "ve", "vz", "zz"}},
+		{"num", allRecs, IndexInt, func(r kvPair) string { return r.v },
+			[]string{"-1", "0", "2", "3", "5", "9", "10", "20", "99"}},
+	}
+	rng := rand.New(rand.NewSource(9438))
+	for iter := 0; iter < 400; iter++ {
+		c := cfgs[iter%len(cfgs)]
+		n := rng.Intn(5) + 1
+		ivs := make([]Interval, n)
+		mkBound := func() (string, bool, bool) {
+			if rng.Intn(4) == 0 {
+				return c.pool[rng.Intn(len(c.pool))], true, false // unbounded
+			}
+			return c.pool[rng.Intn(len(c.pool))], false, rng.Intn(2) == 0
+		}
+		for i := range ivs {
+			min, loInf, loOpen := mkBound()
+			max, hiInf, hiOpen := mkBound()
+			ivs[i] = Interval{
+				Min: min, Max: max,
+				MinOpen: loOpen, MaxOpen: hiOpen,
+				MinUnbounded: loInf, MaxUnbounded: hiInf,
+			}
+		}
+		// Sprinkle duplicates and nested intervals on purpose.
+		if n > 1 && rng.Intn(2) == 0 {
+			ivs[1] = ivs[0]
+		}
+		for _, desc := range []bool{false, true} {
+			exp := modelIntervals(c.recs, c.comp, c.ord, ivs, desc)
+			if err := db.View(func(tx *Tx) error {
+				got, err := scanIntervalsCollect(tx, c.index, ivs, desc)
+				if err != nil {
+					return err
+				}
+				if !pairsEqual(got, exp) {
+					t.Fatalf("iter=%d index=%q desc=%v ivs=%+v\n got %v\n exp %v",
+						iter, c.index, desc, ivs, got, exp)
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+}

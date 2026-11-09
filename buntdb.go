@@ -1389,7 +1389,12 @@ func (dbi *dbItem) writeDeleteTo(buf []byte) []byte {
 // expired evaluates id the item has expired. This will always return false when
 // the item does not have `opts.ex` set to true.
 func (dbi *dbItem) expired() bool {
-	return dbi.opts != nil && dbi.opts.ex && time.Now().After(dbi.opts.exat)
+	return dbi.expiredAt(time.Now())
+}
+
+// expiredAt evaluates if the item has expired relative to the provided time.
+func (dbi *dbItem) expiredAt(now time.Time) bool {
+	return dbi.opts != nil && dbi.opts.ex && now.After(dbi.opts.exat)
 }
 
 // MaxTime from http://stackoverflow.com/questions/25065055#32620397
@@ -1943,6 +1948,374 @@ func (tx *Tx) DescendEqual(index, pivot string,
 		}
 		return iterator(key, value)
 	})
+}
+
+// Interval represents a single interval for use with ScanIntervals.
+type Interval struct {
+	// Min and Max are the lower and upper bounds. When scanning the main
+	// keys tree the bounds are compared as keys; when scanning an ordered
+	// index they are compared as values using the index less function.
+	Min, Max string
+	// MinOpen and MaxOpen mark the corresponding bound as exclusive, as
+	// in the '(' and ')' mathematical notation. A false value means the
+	// bound is inclusive, as in '[' and ']'.
+	// On an ordered index the bounds always refer to the whole equivalence
+	// class of the values that compare equal to the bound. An inclusive
+	// bound therefore yields every primary key of that class, ordered by
+	// key, while an exclusive bound yields none of them.
+	MinOpen, MaxOpen bool
+	// MinUnbounded and MaxUnbounded indicate the absence of a lower or
+	// upper bound. An empty string is a perfectly valid key, value and
+	// bound, so it must not be used in place of an unbounded marker.
+	MinUnbounded, MaxUnbounded bool
+}
+
+// scanBound is an interval bound normalized for scanning. The inf field
+// marks an unbounded side; open marks the bound as exclusive.
+type scanBound struct {
+	val  string
+	open bool
+	inf  bool
+}
+
+// scanInterval is a normalized interval.
+type scanInterval struct {
+	lo, hi scanBound
+}
+
+// normalizeScanIntervals drops empty and reversed intervals, sorts the
+// remaining intervals by their lower bound and merges intervals that
+// overlap or touch at an included equivalence class. The returned slice
+// contains at most len(intervals) entries.
+//
+// Normalization rules:
+//   - A reversed interval (lower bound greater than the upper bound) is
+//     dropped.
+//   - When both bounds belong to the same equivalence class the interval
+//     is reduced to that single class if both bounds are inclusive,
+//     otherwise it is dropped.
+//   - Two intervals are merged when their ranges overlap. If the upper
+//     bound of one and the lower bound of the other belong to the same
+//     equivalence class they are only kept separate when both sides
+//     exclude that class; if either side includes it the intervals are
+//     merged.
+//   - Open flags on unbounded sides are ignored.
+func normalizeScanIntervals(less func(a, b string) bool,
+	intervals []Interval) []scanInterval {
+	ivs := make([]scanInterval, 0, len(intervals))
+	for _, in := range intervals {
+		lo := scanBound{val: in.Min, open: in.MinOpen, inf: in.MinUnbounded}
+		hi := scanBound{val: in.Max, open: in.MaxOpen, inf: in.MaxUnbounded}
+		if lo.inf {
+			lo.open = false
+		}
+		if hi.inf {
+			hi.open = false
+		}
+		if !lo.inf && !hi.inf {
+			if less(hi.val, lo.val) {
+				// reversed interval, normalize it away.
+				continue
+			}
+			if !less(lo.val, hi.val) {
+				// The bounds belong to the same equivalence class. The
+				// interval is either that single class or empty.
+				if lo.open || hi.open {
+					continue
+				}
+				lo.open, hi.open = false, false
+			}
+		}
+		ivs = append(ivs, scanInterval{lo: lo, hi: hi})
+	}
+	// Sort by the lower bound. Unbounded lower bounds come first, bounds
+	// of the same equivalence class are ordered inclusive first, and byte
+	// order is used as a final deterministic tie breaker.
+	sort.SliceStable(ivs, func(i, j int) bool {
+		a, b := ivs[i].lo, ivs[j].lo
+		switch {
+		case a.inf != b.inf:
+			return a.inf
+		case a.inf:
+			return false
+		case less(a.val, b.val):
+			return true
+		case less(b.val, a.val):
+			return false
+		case a.open != b.open:
+			return !a.open
+		default:
+			return a.val < b.val
+		}
+	})
+	// Merge overlapping or touching intervals in place.
+	merged := ivs[:0]
+	for _, iv := range ivs {
+		if len(merged) == 0 {
+			merged = append(merged, iv)
+			continue
+		}
+		cur := &merged[len(merged)-1]
+		if cur.hi.inf {
+			// The current interval already reaches to the upper end of
+			// the universe, nothing that follows can extend or escape it.
+			continue
+		}
+		if iv.lo.inf {
+			// Only possible for the first sorted interval, but handle it
+			// defensively: the merged lower bound becomes unbounded.
+			cur.lo = iv.lo
+		} else {
+			// Determine whether the two intervals are disjoint.
+			switch {
+			case less(cur.hi.val, iv.lo.val):
+				// The upper class is strictly below the next lower class.
+				merged = append(merged, iv)
+				continue
+			case !less(iv.lo.val, cur.hi.val):
+				// Both bounds belong to the same equivalence class. The
+				// intervals only stay separate when that class is excluded
+				// from both sides.
+				if cur.hi.open && iv.lo.open {
+					merged = append(merged, iv)
+					continue
+				}
+			}
+		}
+		// Fold the lower bound flags for same-class lower bounds.
+		if !cur.lo.inf && !iv.lo.inf &&
+			!less(cur.lo.val, iv.lo.val) && !less(iv.lo.val, cur.lo.val) {
+			cur.lo.open = cur.lo.open && iv.lo.open
+		}
+		// Fold the upper bound.
+		switch {
+		case iv.hi.inf:
+			cur.hi = iv.hi
+		case less(cur.hi.val, iv.hi.val):
+			cur.hi = iv.hi
+		case !less(iv.hi.val, cur.hi.val):
+			// Same upper class: included by either interval means
+			// included by the union.
+			cur.hi.open = cur.hi.open && iv.hi.open
+		}
+	}
+	return merged
+}
+
+// ScanIntervals calls the iterator for every live item whose key (main
+// keys tree) or value (ordered index) belongs to the union of the provided
+// intervals. The items are delivered in one unified ascending or, when
+// desc is true, fully reversed descending order.
+//
+// The intervals are normalized with the comparator of the selected index
+// and overlapping intervals are merged before scanning, so duplicate and
+// overlapping ranges never yield duplicate callbacks. Each merged interval
+// is reached with a bounded tree seek: the scan never linearly traverses
+// the gaps between intervals, never collects the whole database to sort it
+// and never keeps the hit keys in memory.
+//
+// On an ordered index an endpoint denotes a value equivalence class: an
+// inclusive endpoint includes the whole class (all of its primary keys),
+// an exclusive endpoint excludes the whole class. Inside a class items are
+// ordered by key and descending scans reverse the complete order.
+//
+// Expired items are filtered against a single time captured for the whole
+// call. Returning false from the iterator stops the scan immediately and
+// no further interval is visited. As with the other iteration methods a
+// writable transaction cannot Set or Delete from inside the iterator,
+// while nested reads are allowed.
+//
+// An invalid index returns ErrNotFound and a spatial (r-tree) index
+// returns ErrInvalidOperation, in both cases before any iterator call.
+func (tx *Tx) ScanIntervals(index string, intervals []Interval, desc bool,
+	iterator func(key, value string) bool) error {
+	if tx.db == nil {
+		return ErrTxClosed
+	}
+	// Resolve the ordered tree and its comparator before anything else so
+	// that invalid indexes are reported prior to any iterator call.
+	var tr *btree.BTree
+	var less func(a, b string) bool
+	if index == "" {
+		// The main keys tree is ordered by raw key bytes.
+		tr = tx.db.keys
+		less = IndexBinary
+	} else {
+		idx := tx.db.idxs[index]
+		if idx == nil {
+			return ErrNotFound
+		}
+		if idx.btr == nil {
+			// The index has no ordered b-tree, e.g. it is a spatial index.
+			return ErrInvalidOperation
+		}
+		tr, less = idx.btr, idx.less
+	}
+	if len(intervals) == 0 {
+		return nil
+	}
+	// Normalize and merge the intervals using the index comparator. Only
+	// this per-call slice, whose size is bounded by the input size, is
+	// retained; hit items are never collected.
+	ivs := normalizeScanIntervals(less, intervals)
+	if len(ivs) == 0 {
+		return nil
+	}
+	// Capture the expiration time once for the whole union.
+	now := time.Now()
+	if tx.wc != nil {
+		tx.wc.itercount++
+		defer func() {
+			tx.wc.itercount--
+		}()
+	}
+	// Bound pivot builders. On an ordered index a non-keyless item sits at
+	// the lower edge (infimum) of the bound equivalence class while a
+	// keyless item sits just past its upper edge (supremum). On the keys
+	// tree every class is a single key, so both pivots are simply that key:
+	// the key comparison fallback treats a keyless item as infinity and
+	// cannot be used as a key successor.
+	infItem := func(v string) *dbItem {
+		if index == "" {
+			return &dbItem{key: v}
+		}
+		return &dbItem{val: v}
+	}
+	supItem := func(v string) *dbItem {
+		if index == "" {
+			return &dbItem{key: v}
+		}
+		return &dbItem{val: v, keyless: true}
+	}
+	var stopped bool
+	if desc {
+		for i := len(ivs) - 1; i >= 0 && !stopped; i-- {
+			iv := ivs[i]
+			// Start pivot: a closed upper bound seeks to the supremum of
+			// the bound class, an open upper bound seeks to its infimum
+			// (the excluded class is skipped below).
+			var pivotI interface{}
+			if !iv.hi.inf {
+				if iv.hi.open {
+					pivotI = infItem(iv.hi.val)
+				} else {
+					pivotI = supItem(iv.hi.val)
+				}
+			}
+			// Lower bound stop pivot: supremum for an open bound, infimum
+			// for a closed bound.
+			var loPivot *dbItem
+			if !iv.lo.inf {
+				if iv.lo.open {
+					loPivot = supItem(iv.lo.val)
+				} else {
+					loPivot = infItem(iv.lo.val)
+				}
+			}
+			var hiInfPivot *dbItem
+			if !iv.hi.inf && iv.hi.open {
+				hiInfPivot = infItem(iv.hi.val)
+			}
+			tr.Descend(pivotI, func(itemI interface{}) bool {
+				dbi := itemI.(*dbItem)
+				// When the upper bound is open the seek may land on the
+				// infimum item of the excluded equivalence class (the key
+				// itself on the keys tree, the empty primary key of the
+				// class on an index). Skip it; descending order guarantees
+				// it is the only item of that class encountered.
+				if hiInfPivot != nil && !tr.Less(dbi, hiInfPivot) {
+					return true
+				}
+				// Lower bound stop.
+				if loPivot != nil {
+					if iv.lo.open {
+						// Continue strictly above the lower class.
+						if !tr.Less(loPivot, dbi) {
+							return false
+						}
+					} else {
+						// Continue while within or above the lower class.
+						if tr.Less(dbi, loPivot) {
+							return false
+						}
+					}
+				}
+				if dbi.expiredAt(now) {
+					return true
+				}
+				if !iterator(dbi.key, dbi.val) {
+					stopped = true
+					return false
+				}
+				return true
+			})
+		}
+	} else {
+		for i := 0; i < len(ivs) && !stopped; i++ {
+			iv := ivs[i]
+			// Start pivot: a closed lower bound seeks to the infimum of
+			// the bound class. An open lower bound seeks to the supremum
+			// on an index, which skips the excluded class with the tree
+			// seek; on the keys tree it seeks to the key itself and the
+			// single equal key is skipped below.
+			var pivotI interface{}
+			skipOpenLower := false
+			if !iv.lo.inf {
+				if iv.lo.open {
+					pivotI = supItem(iv.lo.val)
+					skipOpenLower = index == ""
+				} else {
+					pivotI = infItem(iv.lo.val)
+				}
+			}
+			var loPivot *dbItem
+			if skipOpenLower {
+				loPivot = infItem(iv.lo.val)
+			}
+			// Upper bound stop pivot: infimum for an open bound, supremum
+			// for a closed bound.
+			var hiPivot *dbItem
+			if !iv.hi.inf {
+				if iv.hi.open {
+					hiPivot = infItem(iv.hi.val)
+				} else {
+					hiPivot = supItem(iv.hi.val)
+				}
+			}
+			tr.Ascend(pivotI, func(itemI interface{}) bool {
+				dbi := itemI.(*dbItem)
+				// On the keys tree an open lower bound lands on the bound
+				// key itself, which must be skipped exactly once.
+				if loPivot != nil && !tr.Less(dbi, loPivot) &&
+					!tr.Less(loPivot, dbi) {
+					return true
+				}
+				// Upper bound stop.
+				if hiPivot != nil {
+					if iv.hi.open {
+						// Continue strictly below the upper class.
+						if !tr.Less(dbi, hiPivot) {
+							return false
+						}
+					} else {
+						// Continue while within or below the upper class.
+						if tr.Less(hiPivot, dbi) {
+							return false
+						}
+					}
+				}
+				if dbi.expiredAt(now) {
+					return true
+				}
+				if !iterator(dbi.key, dbi.val) {
+					stopped = true
+					return false
+				}
+				return true
+			})
+		}
+	}
+	return nil
 }
 
 // rect is used by Intersects and Nearby
